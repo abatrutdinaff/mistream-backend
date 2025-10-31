@@ -1,0 +1,32 @@
+[project]
+name = "vnreader"
+version = "0.1.0"
+description = "VN reader utilities"
+authors = [{ name = "NXRLAB" }]
+requires-python = ">=3.11,<3.13"
+
+# Базовые зависимости для вашего стека
+dependencies = [
+    "pywin32 (>=311,<312)",
+    "psutil (>=7.1.2,<8.0.0)",
+    "pillow (>=12.0.0,<13.0.0)",
+    "mss (>=10.1.0,<11.0.0)",
+    "opencv-python (>=4.12.0.88,<5.0.0.0)",
+    "rapidocr-onnxruntime (>=1.4.4,<2.0.0)",
+    "onnxruntime-gpu (==1.23.2)"
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+# Это нужно, если вы где-то хотите брать колёса PyTorch с CUDA.
+# Можно оставить — не мешает.
+[[tool.poetry.source]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu121"
+priority = "explicit"
+
+[tool.poetry]
+# Ключевая строка: НЕ устанавливать текущий проект как пакет.
+package-mode = false
