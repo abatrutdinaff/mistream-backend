@@ -4,7 +4,7 @@ VN Bot GUI v5.4: RapidOCR (ONNXRuntime) c CUDA/TensorRT, узким ROI и сб�
 
 Основные изменения vs v5.3:
 - GPU по умолчанию (TensorRT→CUDA→CPU), включён кеш движков и FP16 (если доступен).
-- SUB_BAND_REL_HEIGHT = 0.18 и ограничение ширины ROI до MAX_BAND_WIDTH = 960.
+- SUB_BAND_REL_HEIGHT = 0.30, ограничение ширины ROI до MAX_BAND_WIDTH = 960 и ползунок в GUI.
 - det_limit_side_len=640, rec_batch_num=16 (на GPU), умеренные значения на CPU.
 - Кластеризация по Y и удаление дублей, чтобы строки не превращались в «кашу».
 """
@@ -54,8 +54,13 @@ USE_GPU = True
 # Порог уверенности символов/строк
 MIN_SCORE = 0.45
 
+# Минимальная доля буквенных символов в собранной строке
+MIN_LINE_LETTER_RATIO = 0.4
+# Минимальная длина итоговой строки (без учёта пробелов)
+MIN_LINE_LENGTH = 2
+
 # Высота нижней полосы (субтитры) относительно всего окна
-SUB_BAND_REL_HEIGHT = 0.18     # было 0.30 — делаем уже
+SUB_BAND_REL_HEIGHT = 0.30
 
 # Кэп ширины ROI перед детектором (ускоряет детект)
 MAX_BAND_WIDTH = 960
@@ -210,7 +215,11 @@ def grab_window(hwnd: int) -> Optional[Image.Image]:
 
 class OCREngine:
     def __init__(self, band_rel_h: float = SUB_BAND_REL_HEIGHT, use_gpu: bool = USE_GPU):
-        self.band_rel_h = band_rel_h
+        self._max_band_rel_h = 0.7
+        self._base_band_rel_h = self._clamp_band_height(band_rel_h)
+        self._current_band_rel_h = self._base_band_rel_h
+        self._empty_band_frames = 0
+        self.band_rel_h = self._current_band_rel_h
         self.use_gpu = use_gpu
         self._ocr = None
         self._lock = threading.Lock()
@@ -385,7 +394,7 @@ class OCREngine:
         if img_bgr is None or img_bgr.ndim != 3 or img_bgr.shape[0] < 2:
             return img_bgr
         h = img_bgr.shape[0]
-        y0 = max(0, min(h - 1, int(h * (1.0 - self.band_rel_h))))
+        y0 = max(0, min(h - 1, int(h * (1.0 - self._current_band_rel_h))))
         band = img_bgr[y0:h, :]
 
         # Кэп по ширине для ускорения детектора
@@ -500,12 +509,30 @@ class OCREngine:
     def _similar(a: str, b: str) -> float:
         return SequenceMatcher(None, a, b).ratio()
 
+    @staticmethod
+    def _letter_ratio(text: str) -> float:
+        if not text:
+            return 0.0
+        chars = [ch for ch in text if not ch.isspace()]
+        if not chars:
+            return 0.0
+        letters = sum(1 for ch in chars if ch.isalpha())
+        return letters / len(chars)
+
     def _assemble_lines(self, items: List[Tuple[float, float, str, Optional[float]]]) -> List[str]:
         # Фильтр по score
         filt: List[Tuple[float, float, str]] = []
         for x, y, t, s in items:
-            if t and (s is None or s >= MIN_SCORE):
-                filt.append((float(x), float(y), t))
+            if not t:
+                continue
+            if s is not None and s < MIN_SCORE:
+                continue
+            if not any(not ch.isspace() for ch in t):
+                continue
+            if not any(ch.isalpha() for ch in t):
+                # Чанк состоит только из цифр или символов
+                continue
+            filt.append((float(x), float(y), t))
 
         if not filt:
             return []
@@ -544,8 +571,14 @@ class OCREngine:
                 last_text = t
                 last_x = x
             line = " ".join(merged).strip()
-            if line:
-                lines.append(line)
+            if not line:
+                continue
+            compact = "".join(ch for ch in line if not ch.isspace())
+            if len(compact) < MIN_LINE_LENGTH:
+                continue
+            if self._letter_ratio(line) < MIN_LINE_LETTER_RATIO:
+                continue
+            lines.append(line)
         return lines
 
     # ----- Основной вызов -----
@@ -575,8 +608,49 @@ class OCREngine:
         lines = self._assemble_lines(items)
         dt = (time.time() - t0) * 1000.0
 
+        self._update_band_height(len(lines) == 0)
+
         print(f"[OCR] Done in {dt:.1f} ms; lines: {len(lines)}", flush=True)
         return "\n".join(lines).strip()
+
+    # ----- Динамическая высота полосы -----
+
+    def set_band_height(self, rel_height: float) -> None:
+        rel = self._clamp_band_height(rel_height)
+        if rel == self._base_band_rel_h:
+            return
+        self._base_band_rel_h = rel
+        self._current_band_rel_h = rel
+        self.band_rel_h = rel
+        self._empty_band_frames = 0
+
+    def get_band_height(self) -> float:
+        return self._base_band_rel_h
+
+    def _clamp_band_height(self, rel_height: float) -> float:
+        return float(min(self._max_band_rel_h, max(0.05, rel_height)))
+
+    def _update_band_height(self, empty: bool) -> None:
+        if empty:
+            self._empty_band_frames = min(10, self._empty_band_frames + 1)
+            target = min(
+                self._max_band_rel_h,
+                self._base_band_rel_h + 0.05 * self._empty_band_frames,
+            )
+            if target > self._current_band_rel_h:
+                self._current_band_rel_h = target
+                self.band_rel_h = target
+        else:
+            if self._empty_band_frames:
+                self._empty_band_frames = 0
+            if self._current_band_rel_h != self._base_band_rel_h:
+                delta = self._current_band_rel_h - self._base_band_rel_h
+                if delta <= 0.01:
+                    self._current_band_rel_h = self._base_band_rel_h
+                else:
+                    self._current_band_rel_h -= min(0.05, delta)
+                self._current_band_rel_h = self._clamp_band_height(self._current_band_rel_h)
+                self.band_rel_h = self._current_band_rel_h
 
 
 # ------------------------ GUI-приложение ------------------------
@@ -590,6 +664,7 @@ class App(tk.Tk):
         self.windows: List[WindowItem] = []
         self.selected_hwnd: Optional[int] = None
         self._ocr_engine = OCREngine(band_rel_h=SUB_BAND_REL_HEIGHT, use_gpu=USE_GPU)
+        self.band_height_var = tk.DoubleVar(value=self._ocr_engine.get_band_height() * 100.0)
         self._game_running = False
         self._play_loop = PlayLoop(
             self._ocr_engine,
@@ -652,6 +727,23 @@ class App(tk.Tk):
         )
         self.btn_stop.pack(side=tk.LEFT, padx=(0, 10))
 
+        frm_settings = ttk.LabelFrame(self, text="Настройки OCR")
+        frm_settings.pack(fill=tk.X, padx=10, pady=(0, 10))
+        self.lbl_band_height = ttk.Label(
+            frm_settings,
+            text=self._format_band_height_label(),
+        )
+        self.lbl_band_height.pack(side=tk.LEFT, padx=(5, 10))
+        self.scale_band = ttk.Scale(
+            frm_settings,
+            from_=10,
+            to=70,
+            orient=tk.HORIZONTAL,
+            variable=self.band_height_var,
+            command=self._handle_band_height_change,
+        )
+        self.scale_band.pack(fill=tk.X, expand=True, padx=(5, 10))
+
         mode = "GPU (TRT→CUDA)" if USE_GPU else "CPU"
         self.lbl_status = ttk.Label(self, text=f"Готово. Режим OCR: {mode}")
         self.lbl_status.pack(fill=tk.X, padx=10, pady=(0, 10))
@@ -689,6 +781,17 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось выбрать окно: {e}")
             self.selected_hwnd = None
+
+    def _format_band_height_label(self) -> str:
+        return f"Высота полосы: {self.band_height_var.get():.0f}%"
+
+    def _handle_band_height_change(self, value: Any) -> None:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return
+        self.lbl_band_height.config(text=self._format_band_height_label())
+        self._ocr_engine.set_band_height(numeric / 100.0)
 
     def handle_double_click(self):
         hwnd = self.selected_hwnd
