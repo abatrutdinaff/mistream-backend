@@ -253,7 +253,16 @@ class OCREngine:
 
         # Быстрые пресеты
         if self.use_gpu:
-            kwargs_common.update(dict(det_limit_side_len=640, rec_batch_num=16))
+            kwargs_common.update(dict(
+                det_limit_side_len=640,
+                rec_batch_num=16,
+                det_use_cuda=True,
+                cls_use_cuda=True,
+                rec_use_cuda=True,
+                det_use_dml=False,
+                cls_use_dml=False,
+                rec_use_dml=False,
+            ))
         else:
             kwargs_common.update(dict(det_limit_side_len=640, rec_batch_num=6))
 
@@ -268,26 +277,79 @@ class OCREngine:
                     rec_keys_path=dic,
                     use_angle_cls=False
                 )
+                if self.use_gpu:
+                    kwargs_fallback.update(dict(
+                        det_use_cuda=True,
+                        cls_use_cuda=True,
+                        rec_use_cuda=True,
+                        det_use_dml=False,
+                        cls_use_dml=False,
+                        rec_use_dml=False,
+                    ))
                 self._ocr = RapidOCR(**kwargs_fallback)
             except Exception:
-                self._ocr = RapidOCR(det_model_path=det, rec_model_path=rec, rec_keys_path=dic)
+                if self.use_gpu:
+                    try:
+                        self._ocr = RapidOCR(
+                            det_model_path=det,
+                            rec_model_path=rec,
+                            rec_keys_path=dic,
+                            det_use_cuda=True,
+                            cls_use_cuda=True,
+                            rec_use_cuda=True,
+                            det_use_dml=False,
+                            cls_use_dml=False,
+                            rec_use_dml=False,
+                        )
+                    except Exception:
+                        self._ocr = RapidOCR(det_model_path=det, rec_model_path=rec, rec_keys_path=dic)
+                else:
+                    self._ocr = RapidOCR(det_model_path=det, rec_model_path=rec, rec_keys_path=dic)
 
         # === ИЗМЕНЕНИЕ: Добавлен диагностический блок для определения CPU/GPU ===
         if self._ocr:
             try:
-                # Получаем список активных провайдеров из сессии ONNX
-                active_providers = self._ocr.det_onnx_session.get_providers()
-                provider_name = active_providers[0] if active_providers else "N/A"
+                # Получаем список активных провайдеров из сессий ONNX
+                providers_det = []
+                providers_rec = []
+                providers_cls = []
 
+                try:
+                    providers_det = self._ocr.text_det.infer.session.get_providers()
+                except AttributeError:
+                    providers_det = []
+
+                try:
+                    providers_rec = self._ocr.text_rec.infer.session.get_providers()
+                except AttributeError:
+                    providers_rec = []
+
+                try:
+                    providers_cls = self._ocr.text_cls.infer.session.get_providers()
+                except AttributeError:
+                    providers_cls = []
+
+                all_providers = [
+                    ("det", providers_det),
+                    ("rec", providers_rec),
+                    ("cls", providers_cls),
+                ]
+
+                # Определяем режим по любому из провайдеров
                 mode = "НЕИЗВЕСТНО"
-                if "CPU" in provider_name:
-                    mode = "CPU"
-                elif "CUDA" in provider_name or "Tensorrt" in provider_name:
-                    mode = "GPU"
+                flat_providers = [p for _, plist in all_providers for p in plist]
+                if flat_providers:
+                    if any("CUDA" in p or "Tensorrt" in p for p in flat_providers):
+                        mode = "GPU"
+                    elif any("CPU" in p for p in flat_providers):
+                        mode = "CPU"
 
-                print("\n" + "="*60, flush=True)
-                print(f"[OCREngine] Движок OCR загружен. Используется: {mode} ({provider_name})")
-                print("="*60 + "\n", flush=True)
+                print("\n" + "=" * 60, flush=True)
+                print(f"[OCREngine] Движок OCR загружен. Режим: {mode}")
+                for name, providers in all_providers:
+                    if providers:
+                        print(f"  [{name}] providers: {', '.join(providers)}")
+                print("=" * 60 + "\n", flush=True)
 
             except AttributeError:
                 # На случай, если в старой версии нет прямого доступа к сессии
