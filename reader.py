@@ -20,6 +20,8 @@ from difflib import SequenceMatcher
 
 import psutil
 
+from tts_player import generate_tts_audio, play_audio_file, TTSRequestError
+
 # GUI
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -623,6 +625,12 @@ class App(tk.Tk):
         self.btn_dbl.pack(side=tk.LEFT, padx=(0, 10))
         self.btn_ocr = ttk.Button(frm_bottom, text="Распознавание текста", command=self.handle_ocr)
         self.btn_ocr.pack(side=tk.LEFT, padx=(0, 10))
+        self.btn_tts = ttk.Button(
+            frm_bottom,
+            text="Распознать и проиграть",
+            command=self.handle_ocr_and_play,
+        )
+        self.btn_tts.pack(side=tk.LEFT, padx=(0, 10))
 
         mode = "GPU (TRT→CUDA)" if USE_GPU else "CPU"
         self.lbl_status = ttk.Label(self, text=f"Готово. Режим OCR: {mode}")
@@ -631,6 +639,7 @@ class App(tk.Tk):
     def _set_buttons_state(self, state: str):
         self.btn_dbl.config(state=state)
         self.btn_ocr.config(state=state)
+        self.btn_tts.config(state=state)
         self.btn_refresh.config(state=state)
 
     def refresh_window_list(self):
@@ -694,6 +703,12 @@ class App(tk.Tk):
     def _set_status(self, s: str):
         self.lbl_status.config(text=s)
 
+    def _show_error(self, title: str, message: str) -> None:
+        messagebox.showerror(title, message)
+
+    def _show_warning(self, title: str, message: str) -> None:
+        messagebox.showwarning(title, message)
+
     def handle_ocr(self):
         hwnd = self.selected_hwnd
         if not hwnd:
@@ -703,6 +718,85 @@ class App(tk.Tk):
         self.lbl_status.config(text="OCR выполняется...")
         self.update_idletasks()
         t = threading.Thread(target=self._ocr_worker, args=(hwnd,), daemon=False)
+        t.start()
+
+    def _ocr_and_play_worker(self, hwnd: int):
+        try:
+            self.after(0, self._set_status, "OCR+TTS: захват окна...")
+            img = grab_window(hwnd)
+            if img is None:
+                print("[OCR+TTS] Не удалось получить скрин окна.", file=sys.stderr, flush=True)
+                self.after(0, self._set_status, "OCR+TTS: ошибка захвата окна.")
+                return
+
+            self.after(0, self._set_status, "OCR+TTS: распознавание...")
+            text = self._ocr_engine.ocr_image(img).strip()
+
+            print("\n" + "="*25 + " OCR+TTS RESULT START " + "="*25)
+            print(text)
+            print("="*24 + " OCR+TTS RESULT END " + "="*25 + "\n", flush=True)
+
+            if not text:
+                self.after(0, self._set_status, "OCR+TTS: текст не найден.")
+                self.after(
+                    0,
+                    self._show_warning,
+                    "Пустой текст",
+                    "Не удалось распознать текст для воспроизведения.",
+                )
+                return
+
+            self.after(0, self._set_status, "OCR+TTS: запрос к TTS...")
+            try:
+                audio_paths = generate_tts_audio(text)
+            except TTSRequestError as exc:
+                print(f"[OCR+TTS] Ошибка TTS: {exc}", file=sys.stderr, flush=True)
+                self.after(0, self._set_status, "OCR+TTS: ошибка TTS.")
+                self.after(0, self._show_error, "Ошибка TTS", str(exc))
+                return
+            except Exception as exc:
+                print(f"[OCR+TTS] Неожиданная ошибка TTS: {exc}", file=sys.stderr, flush=True)
+                traceback.print_exc()
+                self.after(0, self._set_status, "OCR+TTS: ошибка TTS.")
+                self.after(0, self._show_error, "Ошибка TTS", str(exc))
+                return
+
+            main_audio = audio_paths[0]
+            filename = os.path.basename(main_audio)
+            print(f"[OCR+TTS] Воспроизведение файла: {main_audio}", flush=True)
+            self.after(0, self._set_status, f"OCR+TTS: воспроизведение ({filename})...")
+            try:
+                play_audio_file(main_audio)
+            except Exception as exc:
+                print(f"[OCR+TTS] Ошибка воспроизведения: {exc}", file=sys.stderr, flush=True)
+                traceback.print_exc()
+                self.after(0, self._set_status, "OCR+TTS: ошибка воспроизведения.")
+                self.after(0, self._show_error, "Ошибка воспроизведения", str(exc))
+                return
+
+            self.after(0, self._set_status, "OCR+TTS: готово.")
+        except Exception as e:
+            print(f"[OCR+TTS] Критическая ошибка: {e}", file=sys.stderr, flush=True)
+            traceback.print_exc()
+            self.after(0, self._set_status, f"OCR+TTS: ошибка ({type(e).__name__}).")
+            self.after(
+                0,
+                self._show_error,
+                "Ошибка OCR/TTS",
+                f"Произошла ошибка при распознавании и воспроизведении: {e}",
+            )
+        finally:
+            self.after(0, self._set_buttons_state, 'normal')
+
+    def handle_ocr_and_play(self):
+        hwnd = self.selected_hwnd
+        if not hwnd:
+            messagebox.showwarning("Нет окна", "Сначала выбери окно в списке.")
+            return
+        self._set_buttons_state('disabled')
+        self.lbl_status.config(text="OCR+TTS выполняется...")
+        self.update_idletasks()
+        t = threading.Thread(target=self._ocr_and_play_worker, args=(hwnd,), daemon=False)
         t.start()
 
 
