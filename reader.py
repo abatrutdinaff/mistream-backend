@@ -21,6 +21,7 @@ from difflib import SequenceMatcher
 import psutil
 
 from tts_player import generate_tts_audio, play_audio_file, TTSRequestError
+from play_loop import PlayLoop, PlayLoopCallbacks
 
 # GUI
 import tkinter as tk
@@ -589,6 +590,12 @@ class App(tk.Tk):
         self.windows: List[WindowItem] = []
         self.selected_hwnd: Optional[int] = None
         self._ocr_engine = OCREngine(band_rel_h=SUB_BAND_REL_HEIGHT, use_gpu=USE_GPU)
+        self._game_running = False
+        self._play_loop = PlayLoop(
+            self._ocr_engine,
+            grab_window=grab_window,
+            double_click=post_message_double_click,
+        )
         self._build_ui()
         self.refresh_window_list()
 
@@ -631,16 +638,37 @@ class App(tk.Tk):
             command=self.handle_ocr_and_play,
         )
         self.btn_tts.pack(side=tk.LEFT, padx=(0, 10))
+        self.btn_play = ttk.Button(
+            frm_bottom,
+            text="Играть",
+            command=self.handle_start_play,
+        )
+        self.btn_play.pack(side=tk.LEFT, padx=(0, 10))
+        self.btn_stop = ttk.Button(
+            frm_bottom,
+            text="Стоп игра",
+            command=self.handle_stop_play,
+            state="disabled",
+        )
+        self.btn_stop.pack(side=tk.LEFT, padx=(0, 10))
 
         mode = "GPU (TRT→CUDA)" if USE_GPU else "CPU"
         self.lbl_status = ttk.Label(self, text=f"Готово. Режим OCR: {mode}")
         self.lbl_status.pack(fill=tk.X, padx=10, pady=(0, 10))
 
     def _set_buttons_state(self, state: str):
-        self.btn_dbl.config(state=state)
-        self.btn_ocr.config(state=state)
-        self.btn_tts.config(state=state)
-        self.btn_refresh.config(state=state)
+        game_running = self._game_running
+        common_state = "disabled" if state == "disabled" or game_running else "normal"
+        self.btn_dbl.config(state=common_state)
+        self.btn_ocr.config(state=common_state)
+        self.btn_tts.config(state=common_state)
+        self.btn_refresh.config(state=common_state)
+        if game_running:
+            self.btn_play.config(state="disabled")
+            self.btn_stop.config(state="normal")
+        else:
+            self.btn_play.config(state=state)
+            self.btn_stop.config(state="disabled")
 
     def refresh_window_list(self):
         self.windows = enum_top_windows()
@@ -703,11 +731,62 @@ class App(tk.Tk):
     def _set_status(self, s: str):
         self.lbl_status.config(text=s)
 
+    def _make_play_callbacks(self) -> PlayLoopCallbacks:
+        def set_status(message: str) -> None:
+            self.after(0, self._set_status, message)
+
+        def show_warning(title: str, message: str) -> None:
+            self.after(0, self._show_warning, title, message)
+
+        def show_error(title: str, message: str) -> None:
+            self.after(0, self._show_error, title, message)
+
+        def on_start() -> None:
+            def _start() -> None:
+                self._game_running = True
+                self._set_buttons_state('normal')
+
+            self.after(0, _start)
+
+        def on_finish() -> None:
+            def _finish() -> None:
+                self._game_running = False
+                self._set_buttons_state('normal')
+
+            self.after(0, _finish)
+
+        return PlayLoopCallbacks(
+            set_status=set_status,
+            show_warning=show_warning,
+            show_error=show_error,
+            on_start=on_start,
+            on_finish=on_finish,
+        )
+
     def _show_error(self, title: str, message: str) -> None:
         messagebox.showerror(title, message)
 
     def _show_warning(self, title: str, message: str) -> None:
         messagebox.showwarning(title, message)
+
+    def handle_start_play(self):
+        if self._game_running:
+            messagebox.showinfo("Игра уже запущена", "Цикл воспроизведения уже выполняется.")
+            return
+        hwnd = self.selected_hwnd
+        if not hwnd:
+            messagebox.showwarning("Нет окна", "Сначала выбери окно в списке.")
+            return
+        self._set_status("Игровой цикл: запуск...")
+        started = self._play_loop.start(hwnd, self._make_play_callbacks())
+        if not started:
+            messagebox.showinfo("Игра уже запущена", "Цикл воспроизведения уже выполняется.")
+
+    def handle_stop_play(self):
+        if not self._play_loop.stop():
+            messagebox.showinfo("Игра не запущена", "Цикл воспроизведения сейчас не выполняется.")
+            return
+        self._set_status("Игровой цикл: остановка...")
 
     def handle_ocr(self):
         hwnd = self.selected_hwnd
